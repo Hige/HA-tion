@@ -27,7 +27,7 @@ TION_FAN_MODES = (1, 2, 3, 4, 5, 6)
 
 config = FanEntityDescription(
     key="fan_speed",
-    name="скорость вентиляции",
+    translation_key="fan_speed",
     entity_registry_enabled_default=True,
     icon="mdi:fan",
 )
@@ -46,6 +46,8 @@ async def async_setup_entry(hass: HomeAssistant, _config: ConfigEntry, async_add
 
 
 class TionFan(FanEntity, CoordinatorEntity):
+    _attr_has_entity_name = True
+    _attr_name = None
     _attr_supported_features = FanEntityFeature.PRESET_MODE | FanEntityFeature.SET_SPEED | FAN_FEATURE_TURN_ON_OFF
     _attr_oscillating = False
     _attr_preset_mode = tion_preset_display(PRESET_NONE)
@@ -97,7 +99,6 @@ class TionFan(FanEntity, CoordinatorEntity):
 
         CoordinatorEntity.__init__(self=self, coordinator=instance, )
         self.entity_description = description
-        self._attr_name = f"{instance.name} - {description.name}"
         self._attr_device_info = instance.device_info
         self._attr_unique_id = f"{instance.unique_id}-{description.key}"
         self._saved_fan_mode = None

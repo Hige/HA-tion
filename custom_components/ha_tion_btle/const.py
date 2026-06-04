@@ -26,10 +26,6 @@ TION_PRESET_ALIASES = {
     PRESET_BOOST: PRESET_BOOST,
     PRESET_SLEEP: PRESET_SLEEP,
     PRESET_AWAY: PRESET_AWAY,
-    "Обычный": PRESET_NONE,
-    "Максимум": PRESET_BOOST,
-    "Сон": PRESET_SLEEP,
-    "Нет дома": PRESET_AWAY,
 }
 
 

@@ -61,6 +61,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
 class TionClimateEntity(ClimateEntity, CoordinatorEntity):
     """Representation of a Tion device."""
 
+    _attr_has_entity_name = True
     _attr_hvac_modes = [HVACMode.HEAT, HVACMode.FAN_ONLY, HVACMode.OFF]
     _attr_min_temp = 0
     _attr_max_temp = 30
@@ -68,8 +69,10 @@ class TionClimateEntity(ClimateEntity, CoordinatorEntity):
     _attr_precision = PRECISION_WHOLE
     _attr_target_temperature_step = 1
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
+    _attr_name = None
     _attr_preset_mode = tion_preset_display(PRESET_NONE)
     _attr_supported_features = ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.FAN_MODE | ClimateEntityFeature.PRESET_MODE
+    _attr_translation_key = "temperature"
     _attr_icon = 'mdi:air-purifier'
     _attr_fan_mode: int
     coordinator: TionInstance
@@ -101,7 +104,6 @@ class TionClimateEntity(ClimateEntity, CoordinatorEntity):
             self._attr_preset_modes.append(tion_preset_display(PRESET_AWAY))
 
         self._attr_device_info = self.coordinator.device_info
-        self._attr_name = self.coordinator.name
         self._attr_unique_id = self.coordinator.unique_id
 
         self._get_current_state()

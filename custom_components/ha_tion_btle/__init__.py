@@ -293,12 +293,21 @@ class TionInstance(DataUpdateCoordinator):
                 await self._prepare_ble_retry(operation_name, attempt, attempts, err)
 
         message = (
-            f"{self.name}: не удалось выполнить {operation_name} после {attempts} command attempt(s). "
-            f"Последняя ошибка Bluetooth: {last_error}"
+            f"{self.name}: Tion command {operation_name!r} failed after {attempts} command attempt(s). "
+            f"Last Bluetooth error: {last_error}"
         )
         _LOGGER.warning(message)
         if service_call:
-            raise HomeAssistantError(message) from last_error
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="tion_command_failed",
+                translation_placeholders={
+                    "name": self.name,
+                    "operation": operation_name,
+                    "attempts": str(attempts),
+                    "error": str(last_error),
+                },
+            ) from last_error
         raise last_error
 
     @property

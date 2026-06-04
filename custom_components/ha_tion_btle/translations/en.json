@@ -40,8 +40,14 @@
     }
   },
   "entity": {
+    "climate": {
+      "temperature": {
+        "name": "Temperature"
+      }
+    },
     "fan": {
       "fan_speed": {
+        "name": "Fan speed",
         "state_attributes": {
           "preset_mode": {
             "state": {
@@ -53,6 +59,11 @@
           }
         }
       }
+    }
+  },
+  "exceptions": {
+    "tion_command_failed": {
+      "message": "{name}: could not complete {operation} after {attempts} command attempt(s). Last Bluetooth error: {error}"
     }
   }
 

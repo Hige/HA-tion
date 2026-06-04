@@ -1,7 +1,13 @@
 {
   "entity": {
+    "climate": {
+      "temperature": {
+        "name": "Температура"
+      }
+    },
     "fan": {
       "fan_speed": {
+        "name": "Скорость вентиляции",
         "state_attributes": {
           "preset_mode": {
             "state": {
@@ -13,6 +19,11 @@
           }
         }
       }
+    }
+  },
+  "exceptions": {
+    "tion_command_failed": {
+      "message": "{name}: не удалось выполнить {operation} после {attempts} попыток команды. Последняя ошибка Bluetooth: {error}"
     }
   }
 }
