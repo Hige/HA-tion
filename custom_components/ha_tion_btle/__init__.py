@@ -12,6 +12,7 @@ from functools import cached_property
 
 import tion_btle
 from bleak_retry_connector import (
+    BleakConnectionError,
     BleakClientWithServiceCache,
     close_stale_connections_by_address,
     establish_connection,
@@ -19,15 +20,19 @@ from bleak_retry_connector import (
 )
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth import BluetoothCallbackMatcher
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
-from tion_btle.tion import Tion, MaxTriesExceededError
+from tion_btle.tion import Tion, MaxTriesExceededError, TionException
 from .const import DOMAIN, TION_SCHEMA, CONF_KEEP_ALIVE, CONF_AWAY_TEMP, CONF_MAC, PLATFORMS, PRESET_NONE, tion_preset_canonical
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 
 _LOGGER = logging.getLogger(__name__)
 _TION_PATCHED = False
+COMMAND_ATTEMPTS = 3
+COMMAND_RETRY_BASE_DELAY = 2
+COMMAND_RETRY_MAX_DELAY = 8
+POLL_RETRY_ATTEMPTS = 2
 
 
 def _get_ble_device(tion: Tion) -> BLEDevice | None:
@@ -172,6 +177,7 @@ async def async_setup_entry(hass, config_entry: ConfigEntry):
 class TionInstance(DataUpdateCoordinator):
     def __init__(self, hass: HomeAssistant, config_entry: ConfigEntry):
 
+        self._hass: HomeAssistant = hass
         self._config_entry: ConfigEntry = config_entry
 
         assert self.config[CONF_MAC] is not None
@@ -212,6 +218,89 @@ class TionInstance(DataUpdateCoordinator):
             update_method=self.async_update_state,
         )
 
+    def _refresh_btle_device(self) -> BLEDevice | None:
+        """Refresh the BLEDevice object from Home Assistant's Bluetooth cache."""
+        btle_device = bluetooth.async_ble_device_from_address(self._hass, self.config[CONF_MAC], connectable=True)
+        if btle_device is not None:
+            self.__tion.update_btle_device(btle_device)
+        return btle_device
+
+    @staticmethod
+    def _retry_delay(attempt: int) -> int:
+        """Return exponential retry delay for a one-based attempt number."""
+        return min(COMMAND_RETRY_BASE_DELAY * (2 ** max(attempt - 1, 0)), COMMAND_RETRY_MAX_DELAY)
+
+    @staticmethod
+    def _is_retryable_error(err: Exception) -> bool:
+        """Return whether a Tion operation should be retried."""
+        return isinstance(
+            err,
+            (
+                bleak_exc.BleakError,
+                BleakConnectionError,
+                MaxTriesExceededError,
+                TionException,
+                TimeoutError,
+                asyncio.TimeoutError,
+            ),
+        )
+
+    async def _prepare_ble_retry(self, operation_name: str, attempt: int, attempts: int, err: Exception) -> None:
+        """Best-effort cleanup before retrying a BLE operation."""
+        delay = self._retry_delay(attempt)
+        mac = self.config[CONF_MAC]
+
+        _LOGGER.warning(
+            "%s failed for %s on attempt %s/%s: %s. Retrying in %ss",
+            operation_name,
+            self.name,
+            attempt,
+            attempts,
+            err,
+            delay,
+        )
+
+        try:
+            await self.__tion.disconnect()
+        except Exception as disconnect_err:  # pragma: no cover - best-effort BlueZ hygiene
+            _LOGGER.debug("Retry cleanup disconnect failed for %s: %s", mac, disconnect_err)
+
+        btle_device = self._refresh_btle_device()
+        try:
+            await close_stale_connections_by_address(mac)
+            if btle_device is not None:
+                await wait_for_disconnect(btle_device, 1.0)
+        except Exception as cleanup_err:  # pragma: no cover - best-effort BlueZ hygiene
+            _LOGGER.debug("Retry cleanup stale close failed for %s: %s", mac, cleanup_err)
+
+        await asyncio.sleep(delay)
+
+    async def _run_retryable_tion_operation(self, operation_name: str, operation, *, attempts: int, service_call: bool):
+        """Run a Tion operation with command-level retries around BLE failures."""
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            self._refresh_btle_device()
+            try:
+                return await operation()
+            except Exception as err:
+                if not self._is_retryable_error(err):
+                    raise
+
+                last_error = err
+                if attempt >= attempts:
+                    break
+
+                await self._prepare_ble_retry(operation_name, attempt, attempts, err)
+
+        message = (
+            f"{self.name}: не удалось выполнить {operation_name} после {attempts} command attempt(s). "
+            f"Последняя ошибка Bluetooth: {last_error}"
+        )
+        _LOGGER.warning(message)
+        if service_call:
+            raise HomeAssistantError(message) from last_error
+        raise last_error
+
     @property
     def config(self) -> dict:
         try:
@@ -239,17 +328,24 @@ class TionInstance(DataUpdateCoordinator):
 
         async with self._operation_lock:
             try:
-                response = await self.__tion.get()
+                response = await self._run_retryable_tion_operation(
+                    "poll state",
+                    self.__tion.get,
+                    attempts=POLL_RETRY_ATTEMPTS,
+                    service_call=False,
+                )
                 self.update_interval = self.__keep_alive
 
             except MaxTriesExceededError as e:
-                _LOGGER.critical("Got exception %s", str(e))
-                _LOGGER.critical("Will delay next check")
+                _LOGGER.warning("Polling failed for %s: %s. Will delay next check", self.name, e)
                 self.update_interval = self._delay
-                raise UpdateFailed("MaxTriesExceededError")
+                raise UpdateFailed("MaxTriesExceededError") from e
             except Exception as e:
-                _LOGGER.critical(f"{response=}, {e=}")
-                raise e
+                if self._is_retryable_error(e):
+                    _LOGGER.warning("Polling failed for %s: %s", self.name, e)
+                    raise UpdateFailed(str(e)) from e
+                _LOGGER.exception("Unexpected error while polling %s. response=%s", self.name, response)
+                raise
 
         response["is_on"]: bool = self._decode_state(response["state"])
         response["heater"]: bool = self._decode_state(response["heater"])
@@ -281,7 +377,12 @@ class TionInstance(DataUpdateCoordinator):
         args = ', '.join('%s=%r' % x for x in kwargs.items())
         _LOGGER.info("Need to set: " + args)
         async with self._operation_lock:
-            await self.__tion.set(kwargs)
+            await self._run_retryable_tion_operation(
+                f"set {args}",
+                lambda: self.__tion.set(kwargs.copy()),
+                attempts=COMMAND_ATTEMPTS,
+                service_call=True,
+            )
         self.data.update(original_args)
         self.async_update_listeners()
 
@@ -298,7 +399,12 @@ class TionInstance(DataUpdateCoordinator):
         return Breezer(mac)
 
     async def connect(self):
-        return await self.__tion.connect()
+        return await self._run_retryable_tion_operation(
+            "connect",
+            self.__tion.connect,
+            attempts=COMMAND_ATTEMPTS,
+            service_call=True,
+        )
 
     async def disconnect(self):
         return await self.__tion.disconnect()
