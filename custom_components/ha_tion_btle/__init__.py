@@ -1,6 +1,8 @@
 """The Tion breezer component."""
 from __future__ import annotations
 
+import asyncio
+from bleak import exc as bleak_exc
 from bleak.backends.device import BLEDevice
 import datetime
 import logging
@@ -9,23 +11,143 @@ from datetime import timedelta
 from functools import cached_property
 
 import tion_btle
+from bleak_retry_connector import (
+    BleakClientWithServiceCache,
+    close_stale_connections_by_address,
+    establish_connection,
+    wait_for_disconnect,
+)
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth import BluetoothCallbackMatcher
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from tion_btle.tion import Tion, MaxTriesExceededError
-from .const import DOMAIN, TION_SCHEMA, CONF_KEEP_ALIVE, CONF_AWAY_TEMP, CONF_MAC, PLATFORMS
+from .const import DOMAIN, TION_SCHEMA, CONF_KEEP_ALIVE, CONF_AWAY_TEMP, CONF_MAC, PLATFORMS, PRESET_NONE, tion_preset_canonical
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 
 _LOGGER = logging.getLogger(__name__)
+_TION_PATCHED = False
+
+
+def _get_ble_device(tion: Tion) -> BLEDevice | None:
+    """Return the freshest BLE device object known for the Tion instance."""
+    next_device = getattr(tion, "_next_btle_device", None)
+    if isinstance(next_device, BLEDevice):
+        return next_device
+
+    mac = getattr(tion, "_mac", None)
+    if isinstance(mac, BLEDevice):
+        return mac
+
+    client_device = getattr(getattr(tion, "_btle", None), "_device", None)
+    if isinstance(client_device, BLEDevice):
+        return client_device
+
+    return None
+
+
+async def _establish_tion_connection(tion: Tion) -> bool:
+    """Connect via bleak-retry-connector and proactively clear stale BlueZ links."""
+    ble_device = _get_ble_device(tion)
+    if ble_device is None:
+        return await tion._btle.connect()
+
+    try:
+        await close_stale_connections_by_address(ble_device.address)
+        await wait_for_disconnect(ble_device, 1.0)
+    except Exception as err:  # pragma: no cover - best-effort BlueZ hygiene
+        _LOGGER.debug("Failed to close stale BLE connections for %s: %s", ble_device.address, err)
+
+    tion._btle = await establish_connection(
+        BleakClientWithServiceCache,
+        ble_device,
+        name=f"Tion {tion.model} {ble_device.address}",
+        ble_device_callback=lambda: _get_ble_device(tion) or ble_device,
+        use_services_cache=True,
+    )
+    return tion._btle.is_connected
+
+
+async def _patched_try_connect(self: Tion) -> bool:
+    self.set_new_btle_device()
+    return await _establish_tion_connection(self)
+
+
+async def _patched_enable_notifications(self: Tion):
+    _LOGGER.debug("Enabling notifications for %s. %s", self.mac, self.connection_status)
+    if getattr(self, "_Tion__notifications_enabled", False):
+        _LOGGER.debug("Notifications are already enabled for %s", self.mac)
+        return
+
+    try:
+        await self._btle.start_notify(self.uuid_notify, self._delegation.handleNotification)
+    except bleak_exc.BleakDBusError as err:
+        if "Notify acquired" not in str(err):
+            _LOGGER.warning("Got exception %s while enabling notifications!", str(err))
+            raise
+
+        _LOGGER.warning(
+            "Notify acquired for %s while enabling notifications; reconnecting with stale cleanup",
+            self.mac,
+        )
+        try:
+            await self._btle.disconnect()
+        except Exception as disconnect_err:  # pragma: no cover - best effort
+            _LOGGER.debug("Disconnect after notify conflict failed for %s: %s", self.mac, disconnect_err)
+
+        setattr(self, "_Tion__notifications_enabled", False)
+        ble_device = _get_ble_device(self)
+        await close_stale_connections_by_address(self.mac)
+        if ble_device is not None:
+            await wait_for_disconnect(ble_device, 1.0)
+        await _establish_tion_connection(self)
+        await self._btle.start_notify(self.uuid_notify, self._delegation.handleNotification)
+    except bleak_exc.BleakError as err:
+        _LOGGER.warning("Got exception %s while enabling notifications!", str(err))
+        raise
+
+    setattr(self, "_Tion__notifications_enabled", True)
+    _LOGGER.debug("Notifications enabled for %s", self.mac)
+
+
+async def _patched_disconnect(self: Tion):
+    _LOGGER.debug("Disconnecting %s. %s", self.mac, self.connection_status)
+    if self.connection_status != "disc":
+        try:
+            if getattr(self, "_Tion__notifications_enabled", False):
+                try:
+                    await self._btle.stop_notify(self.uuid_notify)
+                except Exception as notify_err:  # pragma: no cover - best effort
+                    _LOGGER.debug("stop_notify failed for %s: %s", self.mac, notify_err)
+            await self._btle.disconnect()
+        finally:
+            setattr(self, "_Tion__notifications_enabled", False)
+            async with self._semaphore:
+                self.set_new_btle_device()
+
+    _LOGGER.debug("Disconnect finished for %s. %s", self.mac, self.connection_status)
+
+
+def _patch_tion_ble() -> None:
+    """Patch tion-btle runtime to use HA's retry-aware BLE connector."""
+    global _TION_PATCHED
+    if _TION_PATCHED:
+        return
+
+    tion_btle.tion.Tion._try_connect = _patched_try_connect
+    tion_btle.tion.Tion._enable_notifications = _patched_enable_notifications
+    tion_btle.tion.Tion._disconnect = _patched_disconnect
+    _TION_PATCHED = True
 
 
 async def async_setup(hass, config):
+    _patch_tion_ble()
     return True
 
 
 async def async_setup_entry(hass, config_entry: ConfigEntry):
+    _patch_tion_ble()
     _LOGGER.info("Setting up %s ", config_entry.unique_id)
 
     hass.data.setdefault(DOMAIN, {})
@@ -68,6 +190,7 @@ class TionInstance(DataUpdateCoordinator):
         self._delay: int = 600
 
         self.__tion: Tion = self.getTion(self.model, btle_device)
+        self._operation_lock = asyncio.Lock()
         self.__keep_alive = datetime.timedelta(seconds=self.__keep_alive)
         self._delay = datetime.timedelta(seconds=self._delay)
         self.rssi: int = 0
@@ -110,19 +233,23 @@ class TionInstance(DataUpdateCoordinator):
     async def async_update_state(self):
         self.logger.info("Tion instance update started")
         response: dict[str, str | bool | int] = {}
+        preset_mode = PRESET_NONE
+        if isinstance(self.data, dict):
+            preset_mode = tion_preset_canonical(self.data.get("preset_mode", PRESET_NONE))
 
-        try:
-            response = await self.__tion.get()
-            self.update_interval = self.__keep_alive
+        async with self._operation_lock:
+            try:
+                response = await self.__tion.get()
+                self.update_interval = self.__keep_alive
 
-        except MaxTriesExceededError as e:
-            _LOGGER.critical("Got exception %s", str(e))
-            _LOGGER.critical("Will delay next check")
-            self.update_interval = self._delay
-            raise UpdateFailed("MaxTriesExceededError")
-        except Exception as e:
-            _LOGGER.critical(f"{response=}, {e=}")
-            raise e
+            except MaxTriesExceededError as e:
+                _LOGGER.critical("Got exception %s", str(e))
+                _LOGGER.critical("Will delay next check")
+                self.update_interval = self._delay
+                raise UpdateFailed("MaxTriesExceededError")
+            except Exception as e:
+                _LOGGER.critical(f"{response=}, {e=}")
+                raise e
 
         response["is_on"]: bool = self._decode_state(response["state"])
         response["heater"]: bool = self._decode_state(response["heater"])
@@ -130,6 +257,7 @@ class TionInstance(DataUpdateCoordinator):
         response["filter_remain"] = math.ceil(response["filter_remain"])
         response["fan_speed"] = int(response["fan_speed"])
         response["rssi"] = self.rssi
+        response["preset_mode"] = tion_preset_canonical(preset_mode)
 
         self.logger.debug(f"Result is {response}")
         return response
@@ -152,7 +280,8 @@ class TionInstance(DataUpdateCoordinator):
 
         args = ', '.join('%s=%r' % x for x in kwargs.items())
         _LOGGER.info("Need to set: " + args)
-        await self.__tion.set(kwargs)
+        async with self._operation_lock:
+            await self.__tion.set(kwargs)
         self.data.update(original_args)
         self.async_update_listeners()
 

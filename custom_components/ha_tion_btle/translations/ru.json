@@ -1,0 +1,18 @@
+{
+  "entity": {
+    "fan": {
+      "fan_speed": {
+        "state_attributes": {
+          "preset_mode": {
+            "state": {
+              "none": "Нет",
+              "boost": "Турбо",
+              "sleep": "Сон",
+              "away": "Не дома"
+            }
+          }
+        }
+      }
+    }
+  }
+}

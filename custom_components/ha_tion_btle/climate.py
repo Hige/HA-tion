@@ -68,8 +68,7 @@ class TionClimateEntity(ClimateEntity, CoordinatorEntity):
     _attr_precision = PRECISION_WHOLE
     _attr_target_temperature_step = 1
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
-    _attr_preset_modes = [PRESET_NONE, PRESET_BOOST, PRESET_SLEEP]
-    _attr_preset_mode = PRESET_NONE
+    _attr_preset_mode = tion_preset_display(PRESET_NONE)
     _attr_supported_features = ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.FAN_MODE | ClimateEntityFeature.PRESET_MODE
     _attr_icon = 'mdi:air-purifier'
     _attr_fan_mode: int
@@ -93,8 +92,13 @@ class TionClimateEntity(ClimateEntity, CoordinatorEntity):
         self._is_boost: bool = False
         self._fan_speed = 1
 
+        self._attr_preset_modes = [
+            tion_preset_display(PRESET_NONE),
+            tion_preset_display(PRESET_BOOST),
+            tion_preset_display(PRESET_SLEEP),
+        ]
         if self._away_temp:
-            self._attr_preset_modes.append(PRESET_AWAY)
+            self._attr_preset_modes.append(tion_preset_display(PRESET_AWAY))
 
         self._attr_device_info = self.coordinator.device_info
         self._attr_name = self.coordinator.name
@@ -137,47 +141,48 @@ class TionClimateEntity(ClimateEntity, CoordinatorEntity):
     async def async_set_preset_mode(self, preset_mode: str):
         """Set new preset mode."""
         actions = []
-        _LOGGER.debug("Going to change preset mode from %s to %s", self.preset_mode, preset_mode)
-        if preset_mode == PRESET_AWAY and self.preset_mode != PRESET_AWAY:
+        canonical_preset = tion_preset_canonical(preset_mode)
+        current_preset = self._current_preset_mode()
+        _LOGGER.debug("Going to change preset mode from %s to %s", current_preset, canonical_preset)
+        if canonical_preset == PRESET_AWAY and current_preset != PRESET_AWAY:
             _LOGGER.info("Going to AWAY mode. Will save target temperature %s", self.target_temperature)
             self._saved_target_temp = self.target_temperature
             actions.append([self._async_set_state, {'heater_temp': self._away_temp}])
 
-        if preset_mode != PRESET_AWAY and self.preset_mode == PRESET_AWAY and self._saved_target_temp:
+        if canonical_preset != PRESET_AWAY and current_preset == PRESET_AWAY and self._saved_target_temp:
             # retuning from away mode
             _LOGGER.info("Returning from AWAY mode: will set saved temperature %s", self._saved_target_temp)
             actions.append([self._async_set_state, {'heater_temp': self._saved_target_temp}])
             self._saved_target_temp = None
 
-        if preset_mode == PRESET_SLEEP and self.preset_mode != PRESET_SLEEP:
+        if canonical_preset == PRESET_SLEEP and current_preset != PRESET_SLEEP:
             _LOGGER.info("Going to night mode: will save fan_speed: %s", self.fan_mode)
             if self._saved_fan_mode is None:
                 self._saved_fan_mode = int(self.fan_mode)
             actions.append([self.async_set_fan_mode, {'fan_mode': min(int(self.fan_mode), self.sleep_max_fan_mode)}])
 
-        if preset_mode == PRESET_BOOST and not self._is_boost:
+        if canonical_preset == PRESET_BOOST and current_preset != PRESET_BOOST:
             self._is_boost = True
             if self._saved_fan_mode is None:
                 self._saved_fan_mode = int(self.fan_mode)
             actions.append([self.async_set_fan_mode, {'fan_mode': self.boost_fan_mode}])
 
-        if self.preset_mode in [PRESET_BOOST, PRESET_SLEEP] and preset_mode not in [PRESET_BOOST, PRESET_SLEEP]:
+        if current_preset in [PRESET_BOOST, PRESET_SLEEP] and canonical_preset not in [PRESET_BOOST, PRESET_SLEEP]:
             # returning from boost or sleep mode
-            _LOGGER.info("Returning from %s mode. Going to set fan speed %d", self.preset_mode, self._saved_fan_mode)
-            if self.preset_mode == PRESET_BOOST:
+            _LOGGER.info("Returning from %s mode. Going to set fan speed %s", current_preset, self._saved_fan_mode)
+            if current_preset == PRESET_BOOST:
                 self._is_boost = False
 
             if self._saved_fan_mode is not None:
                 actions.append([self.async_set_fan_mode, {'fan_mode': self._saved_fan_mode}])
                 self._saved_fan_mode = None
 
-        self._attr_preset_mode = preset_mode
+        self._set_shared_preset_mode(canonical_preset)
         try:
             await self.coordinator.connect()
             for a in actions:
                 await a[0](**a[1])
-            self._attr_preset_mode = preset_mode
-            self._handle_coordinator_update()
+            self._set_shared_preset_mode(canonical_preset, notify=True)
         finally:
             await self.coordinator.disconnect()
 
@@ -197,13 +202,16 @@ class TionClimateEntity(ClimateEntity, CoordinatorEntity):
         return 2
 
     async def async_set_fan_mode(self, fan_mode):
-        if self.preset_mode == PRESET_SLEEP:
+        fan_mode = int(fan_mode)
+        current_preset = self._current_preset_mode()
+
+        if current_preset == PRESET_SLEEP:
             if int(fan_mode) > self.sleep_max_fan_mode:
                 _LOGGER.info("Fan speed %s was required, but I'm in SLEEP mode, so it should not be greater than %d",
                              self.sleep_max_fan_mode)
                 fan_mode = self.sleep_max_fan_mode
 
-        if (self.preset_mode == PRESET_BOOST and self._is_boost) and fan_mode != self.boost_fan_mode:
+        if (current_preset == PRESET_BOOST and self._is_boost) and fan_mode != self.boost_fan_mode:
             _LOGGER.debug("I'm in boost mode. Will ignore requested fan speed %s" % fan_mode)
             fan_mode = self.boost_fan_mode
         if fan_mode != self.fan_mode or not self.coordinator.data.get("is_on"):
@@ -241,11 +249,16 @@ class TionClimateEntity(ClimateEntity, CoordinatorEntity):
 
     def _handle_coordinator_update(self) -> None:
         self._get_current_state()
-        if int(self.fan_mode) != self.boost_fan_mode and (self._is_boost or self.preset_mode == PRESET_BOOST):
+        if int(self.fan_mode) != self.boost_fan_mode and (self._is_boost or self._current_preset_mode() == PRESET_BOOST):
             _LOGGER.warning(f"I'm in boost mode, but current speed {self.fan_mode} is not equal boost speed "
                             f"{self.boost_fan_mode}. Dropping boost mode")
             self._is_boost = False
-            self._attr_preset_mode = PRESET_NONE
+            self._set_shared_preset_mode(PRESET_NONE)
+
+        current_preset = self._current_preset_mode()
+        if current_preset == PRESET_SLEEP and int(self.fan_mode) > self.sleep_max_fan_mode:
+            self._set_shared_preset_mode(PRESET_NONE)
+        self._attr_preset_mode = tion_preset_display(self._current_preset_mode())
 
         self.async_write_ha_state()
 
@@ -262,6 +275,16 @@ class TionClimateEntity(ClimateEntity, CoordinatorEntity):
             HVACMode.HEAT if self.coordinator.data.get("heater") else HVACMode.FAN_ONLY
         self._attr_hvac_action = HVACAction.OFF if not self.coordinator.data.get("is_on") else \
             HVACAction.HEATING if self.coordinator.data.get("is_heating") else HVACAction.FAN
+        self._attr_preset_mode = tion_preset_display(self._current_preset_mode())
+
+    def _current_preset_mode(self) -> str:
+        return tion_preset_canonical(self.coordinator.data.get("preset_mode", PRESET_NONE))
+
+    def _set_shared_preset_mode(self, preset_mode: str, notify: bool = False) -> None:
+        self.coordinator.data["preset_mode"] = tion_preset_canonical(preset_mode)
+        self._attr_preset_mode = tion_preset_display(preset_mode)
+        if notify:
+            self.coordinator.async_update_listeners()
 
     @property
     def available(self) -> bool:

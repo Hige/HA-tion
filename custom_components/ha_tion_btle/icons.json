@@ -1,0 +1,18 @@
+{
+  "entity": {
+    "fan": {
+      "fan_speed": {
+        "state_attributes": {
+          "preset_mode": {
+            "state": {
+              "none": "mdi:minus-circle-outline",
+              "boost": "mdi:rocket-launch",
+              "sleep": "mdi:sleep",
+              "away": "mdi:home-export-outline"
+            }
+          }
+        }
+      }
+    }
+  }
+}

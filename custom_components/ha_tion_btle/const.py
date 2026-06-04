@@ -20,6 +20,26 @@ CONF_MAC = "mac"
 PLATFORMS = [Platform.SENSOR, Platform.CLIMATE, Platform.SELECT, Platform.FAN]
 SUPPORTED_DEVICES = ['S3', 'S4', 'Lite']
 
+TION_PRESET_MODES = [PRESET_NONE, PRESET_BOOST, PRESET_SLEEP, PRESET_AWAY]
+TION_PRESET_ALIASES = {
+    PRESET_NONE: PRESET_NONE,
+    PRESET_BOOST: PRESET_BOOST,
+    PRESET_SLEEP: PRESET_SLEEP,
+    PRESET_AWAY: PRESET_AWAY,
+    "Обычный": PRESET_NONE,
+    "Максимум": PRESET_BOOST,
+    "Сон": PRESET_SLEEP,
+    "Нет дома": PRESET_AWAY,
+}
+
+
+def tion_preset_canonical(preset_mode: str | None) -> str:
+    return TION_PRESET_ALIASES.get(preset_mode, PRESET_NONE)
+
+
+def tion_preset_display(preset_mode: str | None) -> str:
+    return tion_preset_canonical(preset_mode)
+
 TION_SCHEMA = {
     'model': {'type': All(str, In(SUPPORTED_DEVICES)), 'required': True},
     'name': {'type': str, 'default': DEFAULT_NAME, 'required': True},

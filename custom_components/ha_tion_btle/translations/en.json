@@ -38,6 +38,22 @@
         }
       }
     }
+  },
+  "entity": {
+    "fan": {
+      "fan_speed": {
+        "state_attributes": {
+          "preset_mode": {
+            "state": {
+              "none": "None",
+              "boost": "Boost",
+              "sleep": "Sleep",
+              "away": "Away"
+            }
+          }
+        }
+      }
+    }
   }
 
 }
