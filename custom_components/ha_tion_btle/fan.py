@@ -175,7 +175,7 @@ class TionFan(FanEntity, CoordinatorEntity):
             return
 
         if not current_is_on:
-            await self.coordinator.set(is_on=True)
+            await self.coordinator.set(heater=False, is_on=True)
 
         if self._current_fan_mode() != target_mode:
             await self.coordinator.set(fan_speed=target_mode)
@@ -266,7 +266,7 @@ class TionFan(FanEntity, CoordinatorEntity):
 
         self._saved_fan_mode = None
         if not self._current_is_on():
-            await self.coordinator.set(is_on=True)
+            await self.coordinator.set(heater=False, is_on=True)
 
         if target_speed is not None and self._current_fan_mode() != target_speed:
             await self.coordinator.set(fan_speed=target_speed)
