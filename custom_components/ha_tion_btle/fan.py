@@ -94,6 +94,10 @@ class TionFan(FanEntity, CoordinatorEntity):
     def set_percentage(self, percentage: int) -> None:
         raise NotImplemented
 
+    @property
+    def is_on(self) -> bool | None:
+        return self._attr_is_on
+
     def __init__(self, description: FanEntityDescription, instance: TionInstance, hass: HomeAssistant):
         """Initialize the fan."""
 
@@ -128,6 +132,8 @@ class TionFan(FanEntity, CoordinatorEntity):
             registry.entities[entity.entity_id] = attr.evolve(registry.entities[entity.entity_id], **new_value)
             registry.async_schedule_save()
 
+        self._sync_attrs_from_coordinator()
+
     def percent2mode(self, percentage: int) -> int:
         result = 0
         try:
@@ -153,8 +159,9 @@ class TionFan(FanEntity, CoordinatorEntity):
         """Set the speed of the fan, as a percentage."""
         target_mode = self.percent2mode(percentage)
         target_is_on = percentage > 0
+        current_is_on = self._current_is_on()
 
-        if self._current_fan_mode() == target_mode and bool(self.coordinator.data.get("is_on")) == target_is_on:
+        if self._current_fan_mode() == target_mode and current_is_on == target_is_on:
             _LOGGER.debug(
                 "Ignoring duplicate fan request for %s: mode=%s is_on=%s",
                 self.entity_id,
@@ -163,7 +170,15 @@ class TionFan(FanEntity, CoordinatorEntity):
             )
             return
 
-        await self.coordinator.set(fan_speed=target_mode, is_on=target_is_on)
+        if not target_is_on:
+            await self.async_turn_off()
+            return
+
+        if not current_is_on:
+            await self.coordinator.set(is_on=True)
+
+        if self._current_fan_mode() != target_mode:
+            await self.coordinator.set(fan_speed=target_mode)
 
     @cached_property
     def boost_fan_mode(self) -> int:
@@ -171,11 +186,21 @@ class TionFan(FanEntity, CoordinatorEntity):
 
     @property
     def fan_mode(self):
-        return self.coordinator.data.get(self.entity_description.key)
+        data = self.coordinator.data if isinstance(self.coordinator.data, dict) else {}
+        return data.get(self.entity_description.key)
 
     def _current_fan_mode(self) -> int | None:
         fan_mode = self.fan_mode
         return int(fan_mode) if fan_mode is not None else None
+
+    def _current_is_on(self) -> bool:
+        data = self.coordinator.data if isinstance(self.coordinator.data, dict) else {}
+        is_on = data.get("is_on")
+        if isinstance(is_on, bool):
+            return is_on
+        if isinstance(is_on, str):
+            return is_on.lower() == "on"
+        return bool(is_on)
 
     @property
     def sleep_max_fan_mode(self) -> int:
@@ -233,15 +258,19 @@ class TionFan(FanEntity, CoordinatorEntity):
         self._set_shared_preset_mode(canonical_preset, notify=True)
 
     async def async_turn_on(self, percentage: int | None = None, preset_mode: str | None = None, **kwargs, ) -> None:
+        target_speed = None
         if percentage is not None and percentage > 0:
             target_speed = self.percent2mode(percentage)
         elif self._saved_fan_mode is not None:
             target_speed = self._saved_fan_mode
-        else:
-            target_speed = self._current_fan_mode() or 2
 
         self._saved_fan_mode = None
-        await self.coordinator.set(fan_speed=target_speed, is_on=True)
+        if not self._current_is_on():
+            await self.coordinator.set(is_on=True)
+
+        if target_speed is not None and self._current_fan_mode() != target_speed:
+            await self.coordinator.set(fan_speed=target_speed)
+
         if preset_mode is not None:
             await self.async_set_preset_mode(preset_mode)
 
@@ -252,10 +281,11 @@ class TionFan(FanEntity, CoordinatorEntity):
 
         await self.coordinator.set(is_on=False)
 
-    def _handle_coordinator_update(self) -> None:
+    def _sync_attrs_from_coordinator(self) -> None:
         self._attr_assumed_state = False if self.coordinator.last_update_success else True
-        self._attr_is_on = bool(self.coordinator.data.get("is_on"))
-        self._attr_percentage = self.mode2percent() if self._attr_is_on else 0  # should check attr to avoid deadlock
+        self._attr_is_on = self._current_is_on()
+        percentage = self.mode2percent() if self._attr_is_on else 0
+        self._attr_percentage = percentage if percentage is not None else 0
         current_fan_mode = self._current_fan_mode()
         current_preset = self._current_preset_mode()
         if current_preset == PRESET_BOOST and current_fan_mode != self.boost_fan_mode:
@@ -263,6 +293,9 @@ class TionFan(FanEntity, CoordinatorEntity):
         if current_preset == PRESET_SLEEP and current_fan_mode is not None and current_fan_mode > self.sleep_max_fan_mode:
             self._set_shared_preset_mode(PRESET_NONE)
         self._attr_preset_mode = tion_preset_display(self._current_preset_mode())
+
+    def _handle_coordinator_update(self) -> None:
+        self._sync_attrs_from_coordinator()
         self.async_write_ha_state()
 
     @property
